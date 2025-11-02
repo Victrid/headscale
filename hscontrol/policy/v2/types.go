@@ -1583,6 +1583,8 @@ type Policy struct {
 	Hosts         Hosts              `json:"hosts,omitempty"`
 	TagOwners     TagOwners          `json:"tagOwners,omitempty"`
 	ACLs          []ACL              `json:"acls,omitempty"`
+	Postures      Postures           `json:"postures,omitempty"`
+	Grants        []Grant            `json:"grants,omitempty"`
 	AutoApprovers AutoApproverPolicy `json:"autoApprovers"`
 	SSHs          []SSH              `json:"ssh,omitempty"`
 }
@@ -1769,6 +1771,94 @@ func (p *Policy) validate() error {
 		// Validate protocol-port compatibility
 		if err := validateProtocolPortCompatibility(acl.Protocol, acl.Destinations); err != nil {
 			errs = append(errs, err)
+		}
+	}
+
+	for _, grant := range p.Grants {
+		for _, src := range grant.Sources {
+			switch src := src.(type) {
+			case *Host:
+				h := src
+				if !p.Hosts.exist(*h) {
+					errs = append(errs, fmt.Errorf(`Host %q is not defined in the Policy, please define or remove the reference to it`, *h))
+				}
+			case *AutoGroup:
+				ag := src
+
+				if err := validateAutogroupSupported(ag); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+
+				if err := validateAutogroupForSrc(ag); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			case *Group:
+				g := src
+				if err := p.Groups.Contains(g); err != nil {
+					errs = append(errs, err)
+				}
+			case *Tag:
+				tagOwner := src
+				if err := p.TagOwners.Contains(tagOwner); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+
+		// Check for postures
+		for _, posture := range grant.SrcPostures {
+			if _, exist := p.Postures[posture]; !exist {
+				errs = append(errs, fmt.Errorf(`Posture %q is not defined in the Policy, please define or remove the reference to it`, posture))
+			}
+		}
+
+		for _, dst := range grant.Destinations {
+			switch dst.(type) {
+			case *Host:
+				h := dst.(*Host)
+				if !p.Hosts.exist(*h) {
+					errs = append(errs, fmt.Errorf(`Host %q is not defined in the Policy, please define or remove the reference to it`, *h))
+				}
+			case *AutoGroup:
+				ag := dst.(*AutoGroup)
+
+				if err := validateAutogroupSupported(ag); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+
+				if err := validateAutogroupForDst(ag); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			case *Group:
+				g := dst.(*Group)
+				if err := p.Groups.Contains(g); err != nil {
+					errs = append(errs, err)
+				}
+			case *Tag:
+				tagOwner := dst.(*Tag)
+				if err := p.TagOwners.Contains(tagOwner); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+
+		// Validate protocol-port compatibility
+		for _, netCap := range grant.IPs {
+			withPort := []AliasWithPorts{}
+			for _, dst := range grant.Destinations {
+				awp := AliasWithPorts{
+					Alias: dst,
+					Ports: netCap.Port,
+				}
+				withPort = append(withPort, awp)
+			}
+			if err := validateProtocolPortCompatibility(netCap.Protocol, withPort); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 

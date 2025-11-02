@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
@@ -392,6 +393,413 @@ func TestParsing(t *testing.T) {
 			}
 
 			if diff := cmp.Diff(tt.want, rules); diff != "" {
+				t.Errorf("parsing() unexpected result (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGrantParsing(t *testing.T) {
+	users := types.Users{
+		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+	}
+	tests := []struct {
+		name    string
+		format  string
+		acl     string
+		want    []tailcfg.FilterRule
+		wantErr bool
+	}{
+		{
+			name:   "invalid-hujson",
+			format: "hujson",
+			acl: `
+{
+		`,
+			want:    []tailcfg.FilterRule{},
+			wantErr: true,
+		},
+		{
+			name:   "basic-rule",
+			format: "hujson",
+			acl: `
+{
+	"hosts": {
+		"subnet-1": "100.100.101.100/24",
+		"host-1": "100.100.100.100",
+	},
+
+	"grants": [
+		{
+			"src": [
+				"subnet-1",
+				"192.168.1.0/24"
+			],
+			"dst": ["*"],
+			"ip": ["22,3389"]
+		},
+		{
+			"src": [
+				"subnet-1",
+				"192.168.1.0/24"
+			],
+			"dst": ["host-1"],
+			"ip": ["*"]
+		},
+	],
+}
+		`,
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"100.100.101.0/24", "192.168.1.0/24"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "0.0.0.0/0", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+						{IP: "0.0.0.0/0", Ports: tailcfg.PortRange{First: 3389, Last: 3389}},
+						{IP: "::/0", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+						{IP: "::/0", Ports: tailcfg.PortRange{First: 3389, Last: 3389}},
+					},
+					IPProto: []int{protocolTCP, protocolUDP},
+				},
+				{
+					SrcIPs: []string{"100.100.101.0/24", "192.168.1.0/24"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+					},
+					IPProto: []int{protocolTCP, protocolUDP},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:   "parse-protocol",
+			format: "hujson",
+			acl: `
+{
+	"hosts": {
+		"host-1": "100.100.100.100",
+		"subnet-1": "100.100.101.100/24",
+	},
+
+	"grants": [
+		{
+			"src": [
+				"*",
+			],
+			"dst": [
+				"host-1",
+			],
+			"ip": ["tcp:*"]
+		},
+		{
+			"src": [
+				"*",
+			],
+			"dst": [
+				"host-1",
+			],
+			"ip": ["udp:53"]
+		},
+		{
+			"src": [
+				"*",
+			],
+			"dst": [
+				"host-1",
+			],
+			"ip": ["icmp:*"]
+		},
+	],
+}`,
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"0.0.0.0/0", "::/0"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+					},
+					IPProto: []int{protocolTCP},
+				},
+				{
+					SrcIPs: []string{"0.0.0.0/0", "::/0"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "100.100.100.100/32", Ports: tailcfg.PortRange{First: 53, Last: 53}},
+					},
+					IPProto: []int{protocolUDP},
+				},
+				{
+					SrcIPs: []string{"0.0.0.0/0", "::/0"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+					},
+					IPProto: []int{protocolICMP, protocolIPv6ICMP},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:   "port-wildcard",
+			format: "hujson",
+			acl: `
+{
+	"hosts": {
+		"host-1": "100.100.100.100",
+		"subnet-1": "100.100.101.100/24",
+	},
+
+	"grants": [
+		{
+			"src": [
+				"*",
+			],
+			"dst": [
+				"host-1",
+			],
+			"ip": ["*"]
+		},
+	],
+}
+`,
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"0.0.0.0/0", "::/0"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+					},
+					IPProto: []int{protocolTCP, protocolUDP},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:   "port-range",
+			format: "hujson",
+			acl: `
+{
+	"hosts": {
+		"host-1": "100.100.100.100",
+		"subnet-1": "100.100.101.100/24",
+	},
+
+	"grants": [
+		{
+			"src": [
+				"subnet-1",
+			],
+			"dst": [
+				"host-1",
+			],
+			"ip": ["5400-5500"]
+		},
+	],
+}
+`,
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"100.100.101.0/24"},
+					DstPorts: []tailcfg.NetPortRange{
+						{
+							IP:    "100.100.100.100/32",
+							Ports: tailcfg.PortRange{First: 5400, Last: 5500},
+						},
+					},
+					IPProto: []int{protocolTCP, protocolUDP},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:   "port-group",
+			format: "hujson",
+			acl: `
+{
+	"groups": {
+		"group:example": [
+			"testuser@",
+		],
+	},
+
+	"hosts": {
+		"host-1": "100.100.100.100",
+		"subnet-1": "100.100.101.100/24",
+	},
+
+	"grants": [
+		{
+			"src": [
+				"group:example",
+			],
+			"dst": [
+				"host-1",
+			],
+			"ip": ["*"]
+		},
+	],
+}
+`,
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"200.200.200.200/32"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+					},
+					IPProto: []int{protocolTCP, protocolUDP},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:   "port-user",
+			format: "hujson",
+			acl: `
+{
+	"hosts": {
+		"host-1": "100.100.100.100",
+		"subnet-1": "100.100.101.100/24",
+	},
+
+	"grants": [
+		{
+			"src": [
+				"testuser@",
+			],
+			"dst": [
+				"host-1",
+			],
+			"ip": ["*"]
+		},
+	],
+}
+`,
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"200.200.200.200/32"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+					},
+					IPProto: []int{protocolTCP, protocolUDP},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:   "ipv6",
+			format: "hujson",
+			acl: `
+{
+	"hosts": {
+		"host-1": "100.100.100.100/32",
+		"subnet-1": "100.100.101.100/24",
+	},
+
+	"grants": [
+		{
+			"src": [
+				"*",
+			],
+			"dst": [
+				"host-1",
+			],
+			"ip": ["*"]
+		},
+	],
+}
+`,
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"0.0.0.0/0", "::/0"},
+					DstPorts: []tailcfg.NetPortRange{
+						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+					},
+					IPProto: []int{protocolTCP, protocolUDP},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:   "caps",
+			format: "hujson",
+			acl: `
+{
+	"hosts": {
+		"host-1": "100.100.100.100/32",
+		"subnet-1": "100.100.101.100/24",
+	},
+
+	"grants": [
+		{
+			"src": [
+				"*",
+			],
+			"dst": [
+				"host-1",
+			],
+			"app": {
+				"example.com/app": [],
+				"tailscale.com/cap/options": [{"option1": "value1"}, {"option2": 2}]
+			}
+		},
+	],
+}
+`,
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"0.0.0.0/0", "::/0"},
+					CapGrant: []tailcfg.CapGrant{
+						{
+							Dsts: []netip.Prefix{
+								netip.MustParsePrefix("100.100.100.100/32"),
+							},
+							CapMap: tailcfg.PeerCapMap{
+								"example.com/app": []tailcfg.RawMessage{},
+								"tailscale.com/cap/options": []tailcfg.RawMessage{
+									"{\"option1\":\"value1\"}",
+									"{\"option2\":2}",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pol, err := unmarshalPolicy([]byte(tt.acl))
+			if tt.wantErr && err == nil {
+				t.Errorf("parsing() error = %v, wantErr %v", err, tt.wantErr)
+
+				return
+			} else if !tt.wantErr && err != nil {
+				t.Errorf("parsing() error = %v, wantErr %v", err, tt.wantErr)
+
+				return
+			}
+
+			if err != nil {
+				return
+			}
+
+			rules, err := pol.compileFilterRules(
+				users,
+				types.Nodes{
+					&types.Node{
+						IPv4: ap("100.100.100.100"),
+					},
+					&types.Node{
+						IPv4:     ap("200.200.200.200"),
+						User:     users[0],
+						Hostinfo: &tailcfg.Hostinfo{},
+					},
+				}.ViewSlice())
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parsing() error = %v, wantErr %v", err, tt.wantErr)
+
+				return
+			}
+
+			if diff := cmp.Diff(tt.want, rules, cmpopts.EquateComparable(netip.Prefix{})); diff != "" {
 				t.Errorf("parsing() unexpected result (-want +got):\n%s", diff)
 			}
 		})
