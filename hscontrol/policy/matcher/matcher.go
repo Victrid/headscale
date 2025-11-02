@@ -43,8 +43,17 @@ func MatchesFromFilterRules(rules []tailcfg.FilterRule) []Match {
 
 func MatchFromFilterRule(rule tailcfg.FilterRule) Match {
 	dests := []string{}
-	for _, dest := range rule.DstPorts {
-		dests = append(dests, dest.IP)
+	if len(rule.DstPorts) > 0 {
+		for _, dest := range rule.DstPorts {
+			dests = append(dests, dest.IP)
+		}
+	} else if len(rule.CapGrant) > 0 {
+		for _, dest := range rule.CapGrant {
+			dsts := dest.Dsts
+			for _, pref := range dsts {
+				dests = append(dests, pref.String())
+			}
+		}
 	}
 
 	return MatchFromStrings(rule.SrcIPs, dests)

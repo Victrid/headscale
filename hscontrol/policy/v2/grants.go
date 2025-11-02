@@ -90,6 +90,15 @@ func (ip *NetCap) MarshalJSON() ([]byte, error) {
 
 type AppCap map[string][]tailcfg.RawMessage
 
+func (app *AppCap) ToPeerCapMap() tailcfg.PeerCapMap {
+	CapMap := make(tailcfg.PeerCapMap)
+	for name, appDefs := range *app {
+		peerCap := tailcfg.PeerCapability(name)
+		CapMap[peerCap] = appDefs
+	}
+	return CapMap
+}
+
 func (app *AppCap) validate() error {
 	if app == nil {
 		return fmt.Errorf("AppCap is nil")

@@ -2234,6 +2234,20 @@ func (p *Policy) usesAutogroupSelf() bool {
 		}
 	}
 
+	// Check Grant rules
+	for _, grant := range p.Grants {
+		for _, src := range grant.Sources {
+			if ag, ok := src.(*AutoGroup); ok && ag.Is(AutoGroupSelf) {
+				return true
+			}
+		}
+		for _, dest := range grant.Destinations {
+			if ag, ok := dest.(*AutoGroup); ok && ag.Is(AutoGroupSelf) {
+				return true
+			}
+		}
+	}
+
 	// Check SSH rules
 	for _, ssh := range p.SSHs {
 		for _, src := range ssh.Sources {

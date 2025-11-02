@@ -3,6 +3,7 @@ package v2
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -21,7 +22,7 @@ func (pol *Policy) compileFilterRules(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) ([]tailcfg.FilterRule, error) {
-	if pol == nil || pol.ACLs == nil {
+	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
 		return tailcfg.FilterAllowAll, nil
 	}
 
@@ -79,6 +80,97 @@ func (pol *Policy) compileFilterRules(
 		})
 	}
 
+	// The Grant part
+	for _, grant := range pol.Grants {
+
+		srcIPs, err := grant.Sources.Resolve(pol, users, nodes)
+		if err != nil {
+			log.Trace().Caller().Err(err).Msgf("resolving source ips")
+		}
+
+		if srcIPs == nil || len(srcIPs.Prefixes()) == 0 {
+			continue
+		}
+
+		if len(grant.IPs) > 0 {
+			for _, ip := range grant.IPs {
+				protocols, _ := ip.Protocol.parseProtocol()
+
+				var destPorts []tailcfg.NetPortRange
+				for _, dest := range grant.Destinations {
+					ips, err := dest.Resolve(pol, users, nodes)
+					if err != nil {
+						log.Trace().Caller().Err(err).Msgf("resolving destination ips")
+					}
+
+					if ips == nil {
+						log.Debug().Caller().Msgf("destination resolved to nil ips: %v", dest)
+						continue
+					}
+
+					prefixes := ips.Prefixes()
+
+					for _, pref := range prefixes {
+						for _, port := range ip.Port {
+							pr := tailcfg.NetPortRange{
+								IP:    pref.String(),
+								Ports: port,
+							}
+							destPorts = append(destPorts, pr)
+						}
+					}
+				}
+
+				if len(destPorts) == 0 {
+					continue
+				}
+
+				rules = append(rules, tailcfg.FilterRule{
+					SrcIPs:   ipSetToPrefixStringList(srcIPs),
+					DstPorts: destPorts,
+					IPProto:  protocols,
+				})
+			}
+		} else if len(grant.App) > 0 {
+			// Application-based grant
+			var destPrefixes []netip.Prefix
+			for _, dest := range grant.Destinations {
+				ips, err := dest.Resolve(pol, users, nodes)
+				if err != nil {
+					log.Trace().Caller().Err(err).Msgf("resolving destination ips")
+				}
+
+				if ips == nil {
+					log.Debug().Caller().Msgf("destination resolved to nil ips: %v", dest)
+					continue
+				}
+
+				prefixes := ips.Prefixes()
+
+				destPrefixes = append(destPrefixes, prefixes...)
+			}
+
+			capMap := tailcfg.PeerCapMap{}
+			for capName, capOption := range grant.App {
+				capMap[tailcfg.PeerCapability(capName)] = capOption
+			}
+
+			rules = append(rules, tailcfg.FilterRule{
+				SrcIPs: ipSetToPrefixStringList(srcIPs),
+				CapGrant: []tailcfg.CapGrant{{
+					Dsts:   destPrefixes,
+					CapMap: capMap,
+				}},
+			})
+
+		} else {
+			// Unknown rule type
+			log.Debug().Caller().Msgf("Unknown grant rule type, skipping: %v", grant)
+			continue
+		}
+
+	}
+
 	return rules, nil
 }
 
@@ -106,6 +198,20 @@ func (pol *Policy) compileFilterRulesForNode(
 		}
 
 		for _, rule := range aclRules {
+			if rule != nil {
+				rules = append(rules, *rule)
+			}
+		}
+	}
+
+	for _, grant := range pol.Grants {
+		grantRules, err := pol.compileGrants(grant, users, node, nodes)
+		if err != nil {
+			log.Trace().Err(err).Msgf("compiling Grant")
+			continue
+		}
+
+		for _, rule := range grantRules {
 			if rule != nil {
 				rules = append(rules, *rule)
 			}
@@ -264,6 +370,203 @@ func (pol *Policy) compileACLWithAutogroupSelf(
 					DstPorts: destPorts,
 					IPProto:  protocols,
 				})
+			}
+		}
+	}
+
+	return rules, nil
+}
+
+// compileGrants does the same as compileACLWithAutogroupSelf but for Grants.
+func (pol *Policy) compileGrants(
+	grant Grant,
+	users types.Users,
+	node types.NodeView,
+	nodes views.Slice[types.NodeView],
+) ([]*tailcfg.FilterRule, error) {
+	var autogroupSelfDests []Alias
+	var otherDests []Alias
+
+	for _, dest := range grant.Destinations {
+		if ag, ok := dest.(*AutoGroup); ok && ag.Is(AutoGroupSelf) {
+			autogroupSelfDests = append(autogroupSelfDests, dest)
+		} else {
+			otherDests = append(otherDests, dest)
+		}
+	}
+
+	// protocols, _ := acl.Protocol.parseProtocol()
+	var rules []*tailcfg.FilterRule
+
+	var resolvedSrcIPs []*netipx.IPSet
+
+	for _, src := range grant.Sources {
+		if ag, ok := src.(*AutoGroup); ok && ag.Is(AutoGroupSelf) {
+			return nil, fmt.Errorf("autogroup:self cannot be used in sources")
+		}
+
+		ips, err := src.Resolve(pol, users, nodes)
+		if err != nil {
+			log.Trace().Err(err).Msgf("resolving source ips")
+			continue
+		}
+
+		if ips != nil {
+			resolvedSrcIPs = append(resolvedSrcIPs, ips)
+		}
+	}
+
+	if len(resolvedSrcIPs) == 0 {
+		return rules, nil
+	}
+
+	// Handle autogroup:self destinations (if any)
+	if len(autogroupSelfDests) > 0 {
+		// Pre-filter to same-user untagged devices once - reuse for both sources and destinations
+		sameUserNodes := make([]types.NodeView, 0)
+		for _, n := range nodes.All() {
+			if n.User().ID == node.User().ID && !n.IsTagged() {
+				sameUserNodes = append(sameUserNodes, n)
+			}
+		}
+
+		if len(sameUserNodes) > 0 {
+			// Filter sources to only same-user untagged devices
+			var srcIPs netipx.IPSetBuilder
+			for _, ips := range resolvedSrcIPs {
+				for _, n := range sameUserNodes {
+					// Check if any of this node's IPs are in the source set
+					for _, nodeIP := range n.IPs() {
+						if ips.Contains(nodeIP) {
+							n.AppendToIPSet(&srcIPs)
+							break
+						}
+					}
+				}
+			}
+
+			srcSet, err := srcIPs.IPSet()
+			if err != nil {
+				return nil, err
+			}
+
+			var ipSetBuilder netipx.IPSetBuilder
+			for _, n := range sameUserNodes {
+				for _, ip := range n.IPs() {
+					ipSetBuilder.Add(ip)
+				}
+			}
+
+			destSet, err := ipSetBuilder.IPSet()
+			if err != nil {
+				return nil, err
+			}
+
+			if srcSet != nil && len(srcSet.Prefixes()) > 0 {
+				for _, grantIp := range grant.IPs { // Iterate through NetCaps
+					var destPorts []tailcfg.NetPortRange
+					protocols, _ := grantIp.Protocol.parseProtocol()
+
+					for _, prefix := range destSet.Prefixes() {
+						for _, port := range grantIp.Port {
+							pr := tailcfg.NetPortRange{
+								IP:    prefix.String(),
+								Ports: port,
+							}
+							destPorts = append(destPorts, pr)
+						}
+					}
+
+					if len(destPorts) > 0 {
+						rules = append(rules, &tailcfg.FilterRule{
+							SrcIPs:   ipSetToPrefixStringList(srcSet),
+							DstPorts: destPorts,
+							IPProto:  protocols,
+						})
+					}
+				}
+
+				if len(grant.App.ToPeerCapMap()) > 0 {
+					capMap := grant.App.ToPeerCapMap()
+
+					rules = append(rules, &tailcfg.FilterRule{
+						SrcIPs: ipSetToPrefixStringList(srcSet),
+						CapGrant: []tailcfg.CapGrant{
+							{
+								Dsts:   destSet.Prefixes(),
+								CapMap: capMap,
+							},
+						},
+					})
+				}
+
+			}
+		}
+	}
+
+	if len(otherDests) > 0 {
+		var srcIPs netipx.IPSetBuilder
+
+		for _, ips := range resolvedSrcIPs {
+			srcIPs.AddSet(ips)
+		}
+
+		srcSet, err := srcIPs.IPSet()
+		if err != nil {
+			return nil, err
+		}
+
+		if srcSet != nil && len(srcSet.Prefixes()) > 0 {
+			for _, dest := range otherDests {
+				ips, err := dest.Resolve(pol, users, nodes)
+				if err != nil {
+					log.Trace().Err(err).Msgf("resolving destination ips")
+					continue
+				}
+
+				if ips == nil {
+					log.Debug().Msgf("destination resolved to nil ips: %v", dest)
+					continue
+				}
+
+				prefixes := ips.Prefixes()
+
+				for _, grantIp := range grant.IPs { // NetCaps
+					var destPorts []tailcfg.NetPortRange
+					protocols, _ := grantIp.Protocol.parseProtocol()
+					for _, pref := range prefixes {
+						for _, port := range grantIp.Port {
+							pr := tailcfg.NetPortRange{
+								IP:    pref.String(),
+								Ports: port,
+							}
+							destPorts = append(destPorts, pr)
+						}
+					}
+
+					if len(destPorts) > 0 {
+						rules = append(rules, &tailcfg.FilterRule{
+							SrcIPs:   ipSetToPrefixStringList(srcSet),
+							DstPorts: destPorts,
+							IPProto:  protocols,
+						})
+					}
+
+				}
+
+				if len(grant.App.ToPeerCapMap()) > 0 {
+					capMap := grant.App.ToPeerCapMap()
+
+					rules = append(rules, &tailcfg.FilterRule{
+						SrcIPs: ipSetToPrefixStringList(srcSet),
+						CapGrant: []tailcfg.CapGrant{
+							{
+								Dsts:   prefixes,
+								CapMap: capMap,
+							},
+						},
+					})
+				}
 			}
 		}
 	}

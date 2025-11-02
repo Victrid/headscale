@@ -406,14 +406,14 @@ func TestGrantParsing(t *testing.T) {
 	tests := []struct {
 		name    string
 		format  string
-		acl     string
+		grant   string
 		want    []tailcfg.FilterRule
 		wantErr bool
 	}{
 		{
 			name:   "invalid-hujson",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 		`,
 			want:    []tailcfg.FilterRule{},
@@ -422,7 +422,7 @@ func TestGrantParsing(t *testing.T) {
 		{
 			name:   "basic-rule",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 	"hosts": {
 		"subnet-1": "100.100.101.100/24",
@@ -473,7 +473,7 @@ func TestGrantParsing(t *testing.T) {
 		{
 			name:   "parse-protocol",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 	"hosts": {
 		"host-1": "100.100.100.100",
@@ -538,7 +538,7 @@ func TestGrantParsing(t *testing.T) {
 		{
 			name:   "port-wildcard",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 	"hosts": {
 		"host-1": "100.100.100.100",
@@ -572,7 +572,7 @@ func TestGrantParsing(t *testing.T) {
 		{
 			name:   "port-range",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 	"hosts": {
 		"host-1": "100.100.100.100",
@@ -609,7 +609,7 @@ func TestGrantParsing(t *testing.T) {
 		{
 			name:   "port-group",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 	"groups": {
 		"group:example": [
@@ -649,7 +649,7 @@ func TestGrantParsing(t *testing.T) {
 		{
 			name:   "port-user",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 	"hosts": {
 		"host-1": "100.100.100.100",
@@ -683,7 +683,7 @@ func TestGrantParsing(t *testing.T) {
 		{
 			name:   "ipv6",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 	"hosts": {
 		"host-1": "100.100.100.100/32",
@@ -717,7 +717,7 @@ func TestGrantParsing(t *testing.T) {
 		{
 			name:   "caps",
 			format: "hujson",
-			acl: `
+			grant: `
 {
 	"hosts": {
 		"host-1": "100.100.100.100/32",
@@ -765,7 +765,7 @@ func TestGrantParsing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pol, err := unmarshalPolicy([]byte(tt.acl))
+			pol, err := unmarshalPolicy([]byte(tt.grant))
 			if tt.wantErr && err == nil {
 				t.Errorf("parsing() error = %v, wantErr %v", err, tt.wantErr)
 
@@ -1336,6 +1336,177 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 				t.Errorf("SECURITY: destination IP %s should not be included but found in destinations", excludedIP)
 			}
 		}
+	}
+}
+
+func TestCompileFilterRulesGrants(t *testing.T) {
+	users := types.Users{
+		{Model: gorm.Model{ID: 1}, Name: "user1"},
+		{Model: gorm.Model{ID: 2}, Name: "user2"},
+	}
+
+	nodes := types.Nodes{
+		{
+			User: users[0],
+			IPv4: ap("100.64.0.1"),
+		},
+		{
+			User: users[0],
+			IPv4: ap("100.64.0.2"),
+		},
+		{
+			User: users[1],
+			IPv4: ap("100.64.0.3"),
+		},
+		{
+			User: users[1],
+			IPv4: ap("100.64.0.4"),
+		},
+		// Tagged device for user1
+		{
+			User:       users[0],
+			IPv4:       ap("100.64.0.5"),
+			ForcedTags: []string{"tag:test"},
+		},
+		// Tagged device for user2
+		{
+			User:       users[1],
+			IPv4:       ap("100.64.0.6"),
+			ForcedTags: []string{"tag:test"},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		grants   []Grant
+		expected []tailcfg.FilterRule
+	}{
+		{
+			name: "Basic",
+			grants: []Grant{
+				{
+					Sources:      []Alias{pp("10.0.0.1/32")},
+					Destinations: []Alias{pp("192.168.1.0/24")},
+					IPs: []NetCap{
+						{
+							Protocol: "tcp",
+							Port:     []tailcfg.PortRange{{First: 80, Last: 80}},
+						},
+					},
+				},
+			},
+			expected: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"10.0.0.1/32"},
+					DstPorts: []tailcfg.NetPortRange{
+						{
+							IP:    "192.168.1.0/24",
+							Ports: tailcfg.PortRange{First: 80, Last: 80},
+						},
+					},
+					IPProto: []int{protocolTCP},
+				},
+			},
+		},
+		{
+			name: "Basic Multiple Protocols",
+			grants: []Grant{
+				{
+					Sources:      []Alias{pp("10.0.0.1/32"), pp("192.168.1.0/24")},
+					Destinations: []Alias{pp("192.168.1.0/24")},
+					IPs: []NetCap{
+						{
+							Protocol: "tcp",
+							Port:     []tailcfg.PortRange{{First: 80, Last: 80}},
+						},
+						{
+							Protocol: "udp",
+							Port:     []tailcfg.PortRange{{First: 80, Last: 80}},
+						},
+					},
+				},
+			},
+			expected: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"10.0.0.1/32", "192.168.1.0/24"},
+					DstPorts: []tailcfg.NetPortRange{
+						{
+							IP:    "192.168.1.0/24",
+							Ports: tailcfg.PortRange{First: 80, Last: 80},
+						},
+					},
+					IPProto: []int{protocolTCP},
+				},
+				{
+					SrcIPs: []string{"10.0.0.1/32", "192.168.1.0/24"},
+					DstPorts: []tailcfg.NetPortRange{
+						{
+							IP:    "192.168.1.0/24",
+							Ports: tailcfg.PortRange{First: 80, Last: 80},
+						},
+					},
+					IPProto: []int{protocolUDP},
+				},
+			},
+		},
+		{
+			name: "Autogroup with Caps",
+			grants: []Grant{
+				{
+					Sources:      []Alias{agp("autogroup:member")},
+					Destinations: []Alias{agp("autogroup:self")},
+					App: map[string][]tailcfg.RawMessage{
+						"example.com/capability": {
+							tailcfg.RawMessage(`{"key":"value"}`),
+						},
+					},
+				},
+			},
+			expected: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{"100.64.0.1/32", "100.64.0.2/32"},
+					CapGrant: []tailcfg.CapGrant{
+						{
+							Dsts: []netip.Prefix{
+								netip.MustParsePrefix("100.64.0.1/32"),
+								netip.MustParsePrefix("100.64.0.2/32"),
+							},
+							CapMap: tailcfg.PeerCapMap{
+								"example.com/capability": []tailcfg.RawMessage{
+									tailcfg.RawMessage(`{"key":"value"}`),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := &Policy{
+				Grants: tt.grants,
+			}
+
+			err := policy.validate()
+			if err != nil {
+				t.Fatalf("policy validation failed: %v", err)
+			}
+
+			// Test compilation for user1's first node
+			node1 := nodes[0].View()
+
+			rules, err := policy.compileFilterRulesForNode(users, node1, nodes.ViewSlice())
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if diff := cmp.Diff(rules, tt.expected, cmpopts.EquateComparable(netip.Prefix{})); diff != "" {
+				t.Errorf("compiled rules mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
